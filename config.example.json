@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "KOL Mindmap Trading Bot Configuration - Copy this file to config.json and customize as needed. Environment variables take precedence over these settings.",
+  
+  "filter": {
+    "minTradeVolume": 1000,
+    "minConnectedKOLs": 3,
+    "minInfluenceScore": 50,
+    "minTotalTrades": 5
+  },
+  
+  "risk": {
+    "takeProfitPercentage": 50,
+    "stopLossPercentage": 20,
+    "trailingStopEnabled": true
+  },
+  
+  "trading": {
+    "buyAmount": 0.1
+  },
+  
+  "_comments": {
+    "filter": {
+      "minTradeVolume": "Minimum total trade volume across all KOL connections (in USD). Higher values = more selective filtering. Default: 1000",
+      "minConnectedKOLs": "Minimum number of unique KOLs trading the token. More KOLs = stronger signal. Default: 3",
+      "minInfluenceScore": "Minimum average influence score across KOL connections (0-100). Default: 50",
+      "minTotalTrades": "Minimum total number of trades across all KOLs. More trades = more established activity. Default: 5"
+    },
+    "risk": {
+      "takeProfitPercentage": "Percentage gain to trigger automatic sell (1-1000). Default: 50 (50% profit)",
+      "stopLossPercentage": "Percentage loss to trigger automatic sell (1-100). Default: 20 (20% loss)",
+      "trailingStopEnabled": "Enable trailing stop loss. When enabled, stop loss adjusts upward as price increases. Default: true"
+    },
+    "trading": {
+      "buyAmount": "Amount to spend per trade (in SOL). Adjust based on your risk tolerance and capital. Default: 0.1"
+    },
+    "note": "These comments are for documentation only and will be ignored by the bot. Remove the _comments section if you prefer a cleaner config file."
+  }
+}
