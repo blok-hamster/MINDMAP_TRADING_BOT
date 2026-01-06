@@ -16,8 +16,13 @@ import {
   ApiHttpClient,
   WebSocketManager,
   MLPredictionService,
-  TradeExecutor
+  TradeExecutor,
+  TradeHistoryService,
+  AgentLedgerTools,
+  BatchPriceService
 } from './services';
+import { ApiServer } from './server/ApiServer';
+
 
 /**
  * Main application bootstrap function
@@ -74,9 +79,14 @@ async function main(): Promise<void> {
     logger.info('WebSocket manager initialized', { serverUrl: config.api.serverUrl });
     console.log('✅ WebSocket manager initialized\n');
 
+    // Step 6a: Initialize Batch Price Service (Reader/On-Demand)
+    console.log('📉 Initializing Batch Price Service...');
+    const batchPriceService = new BatchPriceService(process.env.SOLANA_RPC_URL!);
+    console.log('✅ Batch Price Service initialized\n');
+
     // Step 6: Initialize filter engine
     console.log('🔍 Initializing filter engine...');
-    const filterEngine = new MindmapFilterEngine(config.filter);
+    const filterEngine = new MindmapFilterEngine(config.filter, batchPriceService);
     logger.info('Filter engine initialized', { criteria: config.filter });
     console.log('✅ Filter engine initialized\n');
 
@@ -88,7 +98,8 @@ async function main(): Promise<void> {
 
     // Step 8: Initialize trade executor
     console.log('💰 Initializing trade executor...');
-    const tradeExecutor = new TradeExecutor(httpClient, cacheService, logger);
+    const ledgerTools = new AgentLedgerTools(logger); // Config loaded from env
+    const tradeExecutor = new TradeExecutor(cacheService, ledgerTools, logger);
     logger.info('Trade executor initialized');
     console.log('✅ Trade executor initialized\n');
 
@@ -106,6 +117,83 @@ async function main(): Promise<void> {
     });
     logger.info('Bot core engine created');
     console.log('✅ Bot core engine created\n');
+
+    // Step 9a: Initialize Trade Watch Service
+    console.log('👀 Initializing Trade Watcher Service...');
+    
+    // Initialize dependencies for Watcher
+    // Initialize dependencies for Watcher
+    const tradeHistoryService = new TradeHistoryService(config.redis.url);
+    
+    // Initialize API Server (which creates WebSocket Server)
+    const apiServer = new ApiServer(tradeHistoryService, config);
+    apiServer.start(); // Start Express + Socket.IO
+
+    // Inject WS Server into TradeHistoryService
+    // We need to cast internal property access or add a public setter
+    // For now, simpler to reconstruct TradeHistoryService with WS or modify constructor usage
+    // Re-initializing TradeHistoryService with WS Server:
+    // (Note: In a cleaner DI system we'd do this differently, but here we just re-instantiate or modify)
+    
+    // Let's modify TradeHistoryService constructor call above instead?
+    // Actually, ApiServer CREATES the WS server. So we need to:
+    // 1. Create ApiServer first? No, ApiServer needs TradeHistoryService. Circular dependency?
+    // ApiServer needs TradeHistoryService for GET requests.
+    // TradeHistoryService needs WebSocketServer for emitting.
+    // WebSocketServer is property of ApiServer.
+    
+    // Solution:
+    // 1. Create TradeHistoryService (no WS yet).
+    // 2. Create ApiServer (passes TradeHistoryService).
+    // 3. Inject ApiServer.wsServer into TradeHistoryService.
+    (tradeHistoryService as any).wsServer = apiServer.wsServer; // Quick fix for property injection
+
+    (tradeHistoryService as any).wsServer = apiServer.wsServer; // Quick fix for property injection
+
+    // --- WORKER THREAD OPTIMIZATION ---
+    console.log('🧵 Spawning Worker Threads...');
+
+    // 1. Price Monitor Worker
+    const { Worker } = await import('worker_threads');
+    const path = await import('path');
+    
+    // Determine environment (TS vs JS)
+    const isTs = __filename.endsWith('.ts');
+    const workerExt = isTs ? '.ts' : '.js';
+    const workerExecArgv = isTs ? ['-r', 'ts-node/register'] : undefined;
+
+    const priceWorkerPath = path.join(__dirname, `workers/priceMonitor${workerExt}`);
+    const priceWorker = new Worker(priceWorkerPath, { execArgv: workerExecArgv });
+    
+    priceWorker.on('error', (err) => console.error('❌ Price Worker Error:', err));
+    priceWorker.on('exit', (code) => console.log(`Price Worker exited with code ${code}`));
+    console.log(`✅ Price Monitor Worker spawned (${workerExt})`);
+
+    // 2. Trade Watcher Worker
+    const watcherWorkerPath = path.join(__dirname, `workers/tradeWatcher${workerExt}`);
+    const watcherWorker = new Worker(watcherWorkerPath, { execArgv: workerExecArgv });
+
+    // Provide Main Thread WebSocket Bridge for Worker Events
+    watcherWorker.on('message', (msg) => {
+        if (msg.type === 'trade_update') {
+            apiServer.wsServer.broadcastTradeUpdate(msg.data);
+        } else if (msg.type === 'price_update') {
+            apiServer.wsServer.broadcastPriceUpdate(msg.data);
+        }
+    });
+
+    watcherWorker.on('error', (err) => console.error('❌ Trade Watcher Worker Error:', err));
+    watcherWorker.on('exit', (code) => console.log(`Trade Watcher Worker exited with code ${code}`));
+    console.log('✅ Trade Watcher Worker spawned\n');
+
+    // Store workers globally for cleanup (or pass to shutdown handler)
+    (global as any).botWorkers = [priceWorker, watcherWorker];
+
+    // Note: We no longer instantiate local BatchPriceService or TradeWatcherService
+    // const batchPriceService = new BatchPriceService(process.env.SOLANA_RPC_URL!);
+    // await batchPriceService.startMonitoring(); 
+    // const tradeWatcherService = new TradeWatcherService(...);
+    // tradeWatcherService.start();
 
     // Step 10: Setup signal handlers for graceful shutdown
     setupSignalHandlers(bot, logger);
@@ -154,6 +242,12 @@ function setupSignalHandlers(bot: BotCoreEngine, logger: any): void {
       try {
         // Call bot.stop() for graceful shutdown
         await bot.stop();
+
+        // Stop Workers
+        if ((global as any).botWorkers) {
+            console.log('🛑 Stopping workers...');
+            (global as any).botWorkers.forEach((w: any) => w.postMessage('STOP'));
+        }
 
         logger.info('✅ Graceful shutdown completed');
         console.log('✅ Shutdown completed successfully\n');

@@ -19,6 +19,7 @@ import {
   MindmapData
 } from '../types';
 import { ErrorHandler } from '../utils/ErrorHandler';
+const USDT_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 /**
  * Bot Engine interface
@@ -61,6 +62,10 @@ export class BotCoreEngine implements IBotEngine {
   private tradeExecutor: ITradeExecutor;
   private config: BotConfig;
   private logger?: any;
+
+  // State
+  private monitoredAttributes: Set<string> = new Set();
+
 
   // Status tracking
   private running: boolean = false;
@@ -113,6 +118,9 @@ export class BotCoreEngine implements IBotEngine {
       
       // Subscribe to KOL trades
       this.wsManager.subscribe(kols);
+      
+      // Store monitored KOLs for filtering
+      this.monitoredAttributes = new Set(kols);
       
       // Mark as running
       this.running = true;
@@ -264,10 +272,11 @@ export class BotCoreEngine implements IBotEngine {
         
         // Filter for active trade subscriptions only
         const activeTradeSubscriptions = subscriptions.filter(
-          sub => sub.isActive && sub.type === 'trade'
+          sub => sub.isActive && sub.type === 'watch'
         );
         
         kols = activeTradeSubscriptions.map(sub => sub.kolWallet);
+        //console.log("kols", kols);
         
         this.logger?.info('✅ Loaded subscribed KOLs', {
           total: subscriptions.length,
@@ -278,6 +287,7 @@ export class BotCoreEngine implements IBotEngine {
         // Get all available KOLs
         this.logger?.info('Fetching all KOL wallets...');
         kols = await this.httpClient.getAllKOLWallets();
+        //console.log("kols", kols);
         this.logger?.info('✅ Loaded all KOLs', { count: kols.length });
       }
       
@@ -360,6 +370,16 @@ export class BotCoreEngine implements IBotEngine {
         tradeType: data.trade.tradeData.tradeType,
         mint: data.trade.tradeData.mint
       });
+
+      // Filter: If in 'subscribed' mode, ensure the KOL is in our list
+      // This is a safety measure in case the server sends extra events
+      if (this.config.monitoring.mode === 'subscribed' && !this.monitoredAttributes.has(data.trade.kolWallet)) {
+        this.logger?.debug('ignoring trade from unsubscribed KOL', { 
+            kolWallet: data.trade.kolWallet, 
+            mode: 'subscribed' 
+        });
+        return;
+      }
 
       // Extract affected token mints from trade data
       const affectedTokens = new Set<string>();
@@ -573,11 +593,61 @@ export class BotCoreEngine implements IBotEngine {
     try {
       this.logger?.info('Processing token', { tokenMint });
 
-      // Check if token is already processed (purchased)
-      const isProcessed = await this.cacheService.isTokenProcessed(tokenMint);
-      
-      if (isProcessed) {
-        this.logger?.info('Token already processed, skipping', { tokenMint });
+      // 1. Check Trading Hours
+      const tradingWindow = this.config.trading.tradingWindow;
+      if (tradingWindow && tradingWindow.enabled) {
+        const now = new Date();
+        const currentHour = now.getUTCHours();
+        const { startHour, endHour } = tradingWindow;
+        
+        let isAllowed = false;
+        
+        if (startHour <= endHour) {
+            // Standard window (e.g. 09:00 - 17:00 UTC)
+            isAllowed = currentHour >= startHour && currentHour < endHour;
+        } else {
+            // Cross-midnight window (e.g. 22:00 - 05:00 UTC)
+            // Allowed if we are LATE in the night (>= start) OR EARLY in the morning (< end)
+            isAllowed = currentHour >= startHour || currentHour < endHour;
+        }
+        
+        if (!isAllowed) {
+            this.logger?.info('Scanning paused: Market outside trading hours', { 
+                currentHourUTC: currentHour, 
+                windowUTC: `${startHour}:00 - ${endHour}:00`,
+                tokenMint 
+            });
+            return;
+        }
+      }
+
+      // Check if token is already processed (purchased) based on entry count
+      const entryCount = await this.cacheService.getEntryCount(tokenMint);
+      const maxEntries = this.config.trading.maxEntriesPerToken || 1;
+      const allowMulti = this.config.trading.allowAdditionalEntries || false;
+
+      this.logger?.debug('Checking entry status', { 
+        tokenMint, 
+        entryCount, 
+        maxEntries, 
+        allowMulti 
+      });
+
+      // Reject if max entries reached
+      if (entryCount >= maxEntries) {
+        this.logger?.info('Max entries reached for token, skipping', { 
+            tokenMint, 
+            entryCount, 
+            maxEntries 
+        });
+        return;
+      }
+
+      // Reject if already entered once and multi-entry is disabled
+      if (entryCount > 0 && !allowMulti) {
+        this.logger?.info('Token already processed and multi-entry disabled, skipping', { 
+            tokenMint 
+        });
         return;
       }
 
@@ -588,7 +658,7 @@ export class BotCoreEngine implements IBotEngine {
       );
       
       if (isPredictionFailed) {
-        this.logger?.debug('Token permanently failed prediction, skipping', {
+        this.logger?.info('Token permanently failed prediction (cached), skipping', {
           tokenMint
         });
         return;
@@ -633,109 +703,144 @@ export class BotCoreEngine implements IBotEngine {
     try {
       this.tokensEvaluated++;
 
-      this.logger?.info('🔍 Evaluating token', {
-        tokenMint,
-        evaluation: this.tokensEvaluated
-      });
-
-      // Step 1: Filter engine evaluation
-      this.logger?.debug('Running filter engine', { tokenMint });
-      const filterResult = this.filterEngine.evaluate(mindmapData);
-
-      this.logger?.info('Filter result', {
-        tokenMint,
-        passed: filterResult.passed,
-        reason: filterResult.reason,
-        metrics: filterResult.metrics
-      });
-
-      if (!filterResult.passed) {
-        this.logger?.info('❌ Token rejected by filter', {
-          tokenMint,
-          reason: filterResult.reason
-        });
+      if(tokenMint === 'So11111111111111111111111111111111111111112' || tokenMint === USDT_MINT) {
+        this.logger?.debug('Skipping native SOL token', { tokenMint });
         return;
       }
 
-      // Step 2: ML prediction with retry logic
-      this.logger?.info('✅ Filter passed, requesting ML prediction', {
-        tokenMint
-      });
+      // 1. Acquire trade lock at the start of evaluation to serialize processing for this token
+      // This prevents multiple filter/prediction runs and ensures atomic entry count checks
+      const lockAcquired = await this.cacheService.acquirePendingTradeLock(tokenMint);
+      if (!lockAcquired) {
+        this.logger?.info('⚠️ Concurrent evaluation prevented by lock', { tokenMint });
+        return;
+      }
 
-      // Check current retry count
-      const retryCount = await this.cacheService.getPredictionRetryCount(tokenMint);
-      const MAX_PREDICTION_RETRIES = 3;
+      try {
+        // 2. Double-Check Lock: Re-verify entry count inside the lock
+        // This handles the case where another thread finished trading just before we got the lock
+        const entryCount = await this.cacheService.getEntryCount(tokenMint);
+        const maxEntries = this.config.trading.maxEntriesPerToken || 1;
+        
+        if (entryCount >= maxEntries) {
+            this.logger?.info('Entry count limit reached (checked inside lock), skipping', { 
+                tokenMint, 
+                entryCount 
+            });
+            return;
+        }
 
-      this.logger?.debug('Prediction retry status', {
-        tokenMint,
-        currentRetries: retryCount,
-        maxRetries: MAX_PREDICTION_RETRIES
-      });
+        this.logger?.info('🔍 Evaluating token', {
+          tokenMint,
+          evaluation: this.tokensEvaluated
+        });
 
-      const predictionResult = await this.predictionService.predict(tokenMint);
+        // Step 1: Filter engine evaluation
+        this.logger?.debug('Running filter engine', { tokenMint });
+        const filterResult = await this.filterEngine.evaluate(mindmapData);
 
-      this.logger?.info('Prediction result', {
-        tokenMint,
-        taskType: predictionResult.taskType,
-        classLabel: predictionResult.classLabel,
-        probability: predictionResult.probability,
-        confidence: predictionResult.confidence,
-        approved: predictionResult.approved,
-        retryAttempt: retryCount + 1
-      });
+        this.logger?.info('Filter result', {
+          tokenMint,
+          passed: filterResult.passed,
+          reason: filterResult.reason,
+          metrics: filterResult.metrics
+        });
 
-      if (!predictionResult.approved) {
-        // Increment retry count
-        const newRetryCount = await this.cacheService.incrementPredictionRetryCount(tokenMint);
-
-        if (newRetryCount >= MAX_PREDICTION_RETRIES) {
-          // Max retries reached, permanently reject token
-          await this.cacheService.markPredictionFailed(tokenMint);
-          this.logger?.warn('❌ Token permanently rejected after max prediction retries', {
+        if (!filterResult.passed) {
+          this.logger?.info('❌ Token rejected by filter', {
             tokenMint,
-            confidence: predictionResult.confidence,
-            totalAttempts: newRetryCount
+            reason: filterResult.reason
+          });
+          return;
+        }
+
+        // Step 2: ML prediction with retry logic
+        this.logger?.info('✅ Filter passed, requesting ML prediction', {
+          tokenMint
+        });
+
+        // Check current retry count
+        const retryCount = await this.cacheService.getPredictionRetryCount(tokenMint);
+        const MAX_PREDICTION_RETRIES = 3;
+
+        this.logger?.debug('Prediction retry status', {
+          tokenMint,
+          currentRetries: retryCount,
+          maxRetries: MAX_PREDICTION_RETRIES
+        });
+
+        const predictionResult = await this.predictionService.predict(tokenMint);
+
+        this.logger?.debug('Prediction result', {
+          tokenMint,
+          taskType: predictionResult.taskType,
+          classLabel: predictionResult.classLabel,
+          probability: predictionResult.probability,
+          confidence: predictionResult.confidence,
+          approved: predictionResult.approved,
+          retryAttempt: retryCount + 1
+        });
+
+        if (!predictionResult.approved) {
+          // Increment retry count
+          const newRetryCount = await this.cacheService.incrementPredictionRetryCount(tokenMint);
+
+          if (newRetryCount >= MAX_PREDICTION_RETRIES) {
+            // Max retries reached, permanently reject token
+            await this.cacheService.markPredictionFailed(tokenMint);
+            this.logger?.warn('❌ Token permanently rejected after max prediction retries', {
+              tokenMint,
+              confidence: predictionResult.confidence,
+              totalAttempts: newRetryCount
+            });
+          } else {
+            // Still have retries left, token can be re-evaluated
+            this.logger?.info('❌ Token rejected by ML prediction, will retry', {
+              tokenMint,
+              confidence: predictionResult.confidence,
+              attempt: newRetryCount,
+              remainingRetries: MAX_PREDICTION_RETRIES - newRetryCount
+            });
+          }
+          return;
+        }
+
+        //Step 3: Trade execution
+        this.logger?.info('✅ Prediction approved, executing trade', {
+          tokenMint,
+          confidence: predictionResult.confidence
+        });
+
+        const tradeRequest = {
+          tokenMint,
+          amount: this.config.trading.buyAmount,
+          riskConfig: this.config.risk,
+          prediction: predictionResult // Include prediction in request
+        };
+
+        const tradeResult = await this.tradeExecutor.execute(tradeRequest);
+
+        if (tradeResult.success) {
+          this.tradesExecuted++;
+          
+          // Increment entry count for re-evaluation tracking
+          await this.cacheService.incrementEntryCount(tokenMint);
+
+          this.logger?.info('✅ Trade executed successfully', {
+            tokenMint,
+            signature: tradeResult.transactionSignature,
+            totalTrades: this.tradesExecuted
           });
         } else {
-          // Still have retries left, token can be re-evaluated
-          this.logger?.info('❌ Token rejected by ML prediction, will retry', {
+          this.logger?.error('❌ Trade execution failed', {
             tokenMint,
-            confidence: predictionResult.confidence,
-            attempt: newRetryCount,
-            remainingRetries: MAX_PREDICTION_RETRIES - newRetryCount
+            error: tradeResult.error
           });
         }
-        return;
+      } finally {
+        // Always release lock
+        await this.cacheService.releasePendingTradeLock(tokenMint);
       }
-
-      // Step 3: Trade execution
-      this.logger?.info('✅ Prediction approved, executing trade', {
-        tokenMint,
-        confidence: predictionResult.confidence
-      });
-
-      const tradeRequest = {
-        tokenMint,
-        amount: this.config.trading.buyAmount,
-        riskConfig: this.config.risk
-      };
-
-      const tradeResult = await this.tradeExecutor.execute(tradeRequest);
-
-      if (tradeResult.success) {
-        this.tradesExecuted++;
-        this.logger?.info('✅ Trade executed successfully', {
-          tokenMint,
-          signature: tradeResult.transactionSignature,
-          totalTrades: this.tradesExecuted
-        });
-      } else {
-        this.logger?.error('❌ Trade execution failed', {
-          tokenMint,
-          error: tradeResult.error
-        });
-      }
-
     } catch (error) {
       this.logger?.error('Error in evaluate and execute', {
         tokenMint,

@@ -8,3 +8,7 @@ export { IWebSocketManager, WebSocketManager, WebSocketConfig } from './WebSocke
 export { IPredictionService, MLPredictionService } from './PredictionService';
 export { ITradeExecutor, TradeExecutor } from './TradeExecutor';
 export { ILogger, LoggerService } from './LoggerService';
+export { TradeHistoryService } from './TradeHistoryService';
+export { BatchPriceService } from './BatchPriceService';
+export { TradeWatcherService } from './TradeWatcherService';
+export { AgentLedgerTools } from './SolanaTxService';

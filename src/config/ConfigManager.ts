@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { BotConfig, FilterCriteria, RiskManagementConfig } from '../types';
+import { BotConfig, FilterCriteria, RiskManagementConfig, PaperTradingConfig } from '../types';
 import { config } from 'dotenv'
 config()
 
@@ -69,6 +69,12 @@ export class ConfigManager {
     }
     if (this.config.filter.minTotalTrades < 0) {
       errors.push('Minimum total trades must be non-negative');
+    }
+    if (this.config.filter.minMarketCapUsd < 0) {
+      errors.push('Minimum market cap must be non-negative');
+    }
+    if (this.config.filter.minLiquidityUsd < 0) {
+      errors.push('Minimum liquidity must be non-negative');
     }
 
     // Validate risk management
@@ -182,6 +188,23 @@ export class ConfigManager {
     if (process.env.MIN_TOTAL_TRADES) {
       filterConfig.minTotalTrades = parseInt(process.env.MIN_TOTAL_TRADES, 10);
     }
+    if (process.env.MIN_MARKET_CAP_USD) {
+      filterConfig.minMarketCapUsd = parseFloat(process.env.MIN_MARKET_CAP_USD);
+    }
+    if (process.env.MIN_LIQUIDITY_USD) {
+      filterConfig.minLiquidityUsd = parseFloat(process.env.MIN_LIQUIDITY_USD);
+    }
+    // Advanced Signals
+    if (process.env.MIN_VIRAL_VELOCITY) {
+      filterConfig.minViralVelocity = parseFloat(process.env.MIN_VIRAL_VELOCITY);
+    }
+    if (process.env.REQUIRE_SMART_MONEY) {
+      filterConfig.requireSmartMoney = process.env.REQUIRE_SMART_MONEY === 'true';
+    }
+    if (process.env.MIN_CONSENSUS_SCORE) {
+      filterConfig.minConsensusScore = parseFloat(process.env.MIN_CONSENSUS_SCORE);
+    }
+
     if (Object.keys(filterConfig).length > 0) {
       config.filter = filterConfig as FilterCriteria;
     }
@@ -197,15 +220,46 @@ export class ConfigManager {
     if (process.env.TRAILING_STOP_ENABLED) {
       riskConfig.trailingStopEnabled = process.env.TRAILING_STOP_ENABLED === 'true';
     }
+    if (process.env.TRAILING_STOP_PERCENTAGE) {
+      riskConfig.trailingStopPercentage = parseFloat(process.env.TRAILING_STOP_PERCENTAGE);
+    }
     if (Object.keys(riskConfig).length > 0) {
       config.risk = riskConfig as RiskManagementConfig;
     }
 
-    // Trading configuration
     if (process.env.BUY_AMOUNT) {
       config.trading = {
         buyAmount: parseFloat(process.env.BUY_AMOUNT),
+        allowAdditionalEntries: process.env.ALLOW_ADDITIONAL_ENTRIES === 'true',
+        maxEntriesPerToken: process.env.MAX_ENTRIES_PER_TOKEN ? parseInt(process.env.MAX_ENTRIES_PER_TOKEN, 10) : 1,
+        tradingWindow: {
+            enabled: process.env.TRADING_WINDOW_ENABLED === 'true',
+            startHour: process.env.TRADING_WINDOW_START ? parseInt(process.env.TRADING_WINDOW_START, 10) : 0,
+            endHour: process.env.TRADING_WINDOW_END ? parseInt(process.env.TRADING_WINDOW_END, 10) : 23
+        }
       };
+    } else {
+        // Ensure default trading window config even if buy amount isn't set (though buy amount is required)
+        config.trading = {
+            buyAmount: 0.1, // Default fallback
+            tradingWindow: {
+                enabled: process.env.TRADING_WINDOW_ENABLED === 'true',
+                startHour: process.env.TRADING_WINDOW_START ? parseInt(process.env.TRADING_WINDOW_START, 10) : 0,
+                endHour: process.env.TRADING_WINDOW_END ? parseInt(process.env.TRADING_WINDOW_END, 10) : 23
+            }
+        };
+    }
+
+    // Paper trading configuration
+    const paperConfig: Partial<PaperTradingConfig> = {};
+    if (process.env.SIMULATING) {
+        paperConfig.enabled = process.env.SIMULATING === 'true';
+    }
+    if (process.env.PAPER_TRADING_INITIAL_SOL) {
+        paperConfig.initialBalance = parseFloat(process.env.PAPER_TRADING_INITIAL_SOL);
+    }
+    if (Object.keys(paperConfig).length > 0) {
+        config.paper = paperConfig as PaperTradingConfig;
     }
 
     // Logging configuration
@@ -263,6 +317,8 @@ export class ConfigManager {
         minConnectedKOLs: 2,
         minInfluenceScore: 50,
         minTotalTrades: 5,
+        minMarketCapUsd: 0,
+        minLiquidityUsd: 0,
       },
       risk: {
         takeProfitPercentage: 50,
@@ -271,6 +327,10 @@ export class ConfigManager {
       },
       trading: {
         buyAmount: 0.1,
+      },
+      paper: {
+        enabled: process.env.SIMULATING === 'true',
+        initialBalance: 10,
       },
       logging: {
         level: 'info',

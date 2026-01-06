@@ -263,7 +263,7 @@ export class ApiHttpClient implements IHttpClient {
       // Extract the first prediction result (we only sent one mint)
       const prediction = response.data?.[0];
 
-      console.log("PREDICTION RESULT", prediction)
+      // console.log("PREDICTION RESULT", prediction)
       
       if (!prediction) {
         this.logger?.error('No prediction result returned', { tokenMint });
@@ -309,7 +309,7 @@ export class ApiHttpClient implements IHttpClient {
         watchConfig: request.watchConfig
       });
 
-      console.log("SWAP REQUEST", request)
+      // console.log("SWAP REQUEST", request)
       
       // Note: We don't use ErrorHandler.withRetry here because we don't want
       // to retry swap operations automatically (could cause duplicate trades)
@@ -329,7 +329,7 @@ export class ApiHttpClient implements IHttpClient {
         };
       }>('/api/features/perform-swap', request);
 
-      console.log("SWAP RESPONSE", response.data)
+      // console.log("SWAP RESPONSE", response.data)
       
       // Extract the first result from the batch response
       const firstResult = response.data.data?.results?.[0];
@@ -354,7 +354,7 @@ export class ApiHttpClient implements IHttpClient {
         error: !firstResult.success ? firstResult.message : undefined
       };
 
-      console.log("SWAP RESULT", result)
+      // console.log("SWAP RESULT", result)
       
       if (result.success) {
         this.logger?.info('Swap queued successfully', {

@@ -91,6 +91,20 @@ These criteria determine which tokens pass the initial filter before ML predicti
 - Range: 0 to infinity
 - Recommendation: 3-10 for active tokens
 
+**minMarketCapUsd** (optional)
+- Description: Minimum market capitalization in USD
+- Environment Variable: `MIN_MARKET_CAP_USD`
+- Default: `0` (disabled)
+- Range: 0 to infinity
+- Recommendation: 1000-10000 to filter out dead coins
+
+**minLiquidityUsd** (optional)
+- Description: Minimum liquidity in USD
+- Environment Variable: `MIN_LIQUIDITY_USD`
+- Default: `0` (disabled)
+- Range: 0 to infinity
+- Recommendation: 500-2000 to ensure tradeability
+
 ### Risk Management Configuration
 
 **takeProfitPercentage** (required)

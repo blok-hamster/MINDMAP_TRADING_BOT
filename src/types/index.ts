@@ -17,6 +17,12 @@ export interface FilterCriteria {
   minConnectedKOLs: number;
   minInfluenceScore: number;
   minTotalTrades: number;
+  minMarketCapUsd: number;
+  minLiquidityUsd: number;
+  // Advanced Signal thresholds
+  minViralVelocity?: number; // Trades per minute
+  minConsensusScore?: number; // % of active KOLs buying
+  requireSmartMoney?: boolean; // If true, requires weighted volume > raw volume
 }
 
 /**
@@ -26,6 +32,7 @@ export interface RiskManagementConfig {
   takeProfitPercentage: number;
   stopLossPercentage: number;
   trailingStopEnabled: boolean;
+  trailingStopPercentage?: number;
 }
 
 /**
@@ -55,6 +62,13 @@ export interface MonitoringConfig {
  */
 export interface TradingConfig {
   buyAmount: number;
+  allowAdditionalEntries?: boolean;
+  maxEntriesPerToken?: number;
+  tradingWindow?: {
+    startHour: number; // 0-23
+    endHour: number;   // 0-23
+    enabled: boolean;
+  };
 }
 
 /**
@@ -62,6 +76,14 @@ export interface TradingConfig {
  */
 export interface LoggingConfig {
   level: 'debug' | 'info' | 'warn' | 'error';
+}
+
+/**
+ * Paper Trading configuration
+ */
+export interface PaperTradingConfig {
+  enabled: boolean;
+  initialBalance: number;
 }
 
 /**
@@ -74,6 +96,7 @@ export interface BotConfig {
   filter: FilterCriteria;
   risk: RiskManagementConfig;
   trading: TradingConfig;
+  paper: PaperTradingConfig;
   logging: LoggingConfig;
 }
 
@@ -130,7 +153,11 @@ export interface FilterResult {
     connectedKOLs: number;
     avgInfluenceScore: number;
     totalTrades: number;
+    viralVelocity?: number;
+    weightedVolume?: number;
+    consensusScore?: number;
   };
+  signals?: string[]; // Detected signals: "VIRAL_SPIKE", "SMART_MONEY", "HIGH_CONSENSUS"
 }
 
 /**
@@ -165,6 +192,7 @@ export interface TradeRequest {
   tokenMint: string;
   amount: number;
   riskConfig: RiskManagementConfig;
+  prediction?: PredictionResult;
 }
 
 /**

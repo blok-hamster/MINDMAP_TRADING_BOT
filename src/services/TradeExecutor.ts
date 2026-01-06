@@ -5,14 +5,13 @@
  * and post-execution cleanup operations.
  */
 
-import { IHttpClient } from './HttpClient';
 import { ICacheService } from './CacheService';
 import {
   TradeRequest,
   TradeResult,
-  SwapRequest
 } from '../types';
 import { ErrorHandler } from '../utils/ErrorHandler';
+import { AgentLedgerTools } from './SolanaTxService'; // Import AgentLedgerTools
 
 /**
  * Trade Executor interface
@@ -31,8 +30,8 @@ export class TradeExecutor implements ITradeExecutor {
   private logger?: any;
 
   constructor(
-    private httpClient: IHttpClient,
     private cacheService: ICacheService,
+    private ledgerTools: AgentLedgerTools, // Inject AgentLedgerTools
     logger?: any
   ) {
     this.logger = logger;
@@ -45,64 +44,57 @@ export class TradeExecutor implements ITradeExecutor {
    * @returns Trade result with success status and transaction details
    */
   async execute(trade: TradeRequest): Promise<TradeResult> {
-    const { tokenMint, amount, riskConfig } = trade;
+    const { tokenMint, amount, riskConfig, prediction } = trade;
 
     try {
       this.logger?.info('Starting trade execution', {
         tokenMint,
         amount,
-        riskConfig
+        riskConfig,
+        hasPrediction: !!prediction
       });
 
-      // Step 1: Check for duplicate trades
-      const isDuplicate = await this.checkDuplicate(tokenMint);
-      if (isDuplicate) {
-        this.logger?.warn('Duplicate trade prevented', { tokenMint });
-        return {
-          success: false,
-          tokenMint,
-          error: 'Token already processed - duplicate trade prevented'
-        };
-      }
+      // Step 1: Duplicate check handled by BotCoreEngine
+      // We rely on the orchestrator to enforce entry limits.
+      // const isDuplicate = await this.checkDuplicate(tokenMint);
+      // if (isDuplicate) { ... }
 
       // Step 2: Execute the swap transaction
       this.logger?.info('Executing swap transaction', { tokenMint, amount });
-      const swapRequest: SwapRequest = {
-        tradeType: 'buy',
-        mint: tokenMint,
+      
+      const swapResult = await this.ledgerTools.performSwap({
         amount,
+        action: 'buy',
+        mint: tokenMint,
         watchConfig: {
           takeProfitPercentage: riskConfig.takeProfitPercentage,
           stopLossPercentage: riskConfig.stopLossPercentage,
           enableTrailingStop: riskConfig.trailingStopEnabled,
-          // Include trailingPercentage when trailing stop is enabled
-          // Use stopLossPercentage as the trailing distance
-          ...(riskConfig.trailingStopEnabled && {
-            trailingPercentage: riskConfig.stopLossPercentage
-          })
-        }
-      };
-
-      const swapResult = await this.httpClient.performSwap(swapRequest);
-      console.log('Swap Result:', swapResult);
+          trailingStopPercentage: riskConfig.trailingStopEnabled 
+            ? (riskConfig.trailingStopPercentage || riskConfig.stopLossPercentage) 
+            : undefined,
+          maxHoldTimeMinutes: 60 // Default, can be exposed in riskConfig later
+        },
+        prediction // Pass prediction to SolanaTxService
+      });
+      // console.log('Swap Result:', swapResult);
 
       if (!swapResult.success) {
         this.logger?.error('Swap execution failed', {
           tokenMint,
-          error: swapResult.error || swapResult.message
+          error: swapResult.message
         });
         return {
           success: false,
           tokenMint,
-          error: swapResult.error || swapResult.message || 'Swap execution failed'
+          error: swapResult.message || 'Swap execution failed'
         };
       }
 
       // Step 3: Post-execution cleanup
       this.logger?.info('Trade queued successfully, performing cleanup', {
         tokenMint,
-        jobId: swapResult.jobId,
-        queuePosition: swapResult.queuePosition
+        message: swapResult.message
       });
 
       await this.markAsProcessed(tokenMint);
@@ -110,14 +102,14 @@ export class TradeExecutor implements ITradeExecutor {
 
       this.logger?.info('Trade execution completed', {
         tokenMint,
-        jobId: swapResult.jobId,
+        //jobId: swapResult.jobId,
         message: swapResult.message
       });
 
       return {
         success: true,
         tokenMint,
-        transactionSignature: swapResult.jobId // Use jobId as the transaction identifier
+        transactionSignature: (swapResult.data as any)?.txid || (swapResult.data as any)?.swapResponse?.txid// Use txid as the transaction identifier
       };
 
     } catch (error) {
@@ -140,34 +132,7 @@ export class TradeExecutor implements ITradeExecutor {
     }
   }
 
-  /**
-   * Check if token has already been processed (duplicate prevention)
-   * 
-   * Queries the processed tokens set in Redis to verify the token
-   * has not been previously purchased.
-   * 
-   * @param tokenMint - Token mint address to check
-   * @returns True if token has been processed, false otherwise
-   */
-  private async checkDuplicate(tokenMint: string): Promise<boolean> {
-    try {
-      this.logger?.debug('Checking for duplicate trade', { tokenMint });
-      const isProcessed = await this.cacheService.isTokenProcessed(tokenMint);
-      
-      if (isProcessed) {
-        this.logger?.info('Token already processed', { tokenMint });
-      }
-      
-      return isProcessed;
-    } catch (error) {
-      this.logger?.error('Error checking duplicate', {
-        tokenMint,
-        error: (error as Error).message
-      });
-      // On error, assume not duplicate to avoid blocking valid trades
-      return false;
-    }
-  }
+
 
   /**
    * Mark token as processed after successful trade

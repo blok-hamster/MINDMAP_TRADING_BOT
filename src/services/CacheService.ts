@@ -20,9 +20,14 @@ export interface ICacheService {
   deleteMindmapData(tokenMint: string): Promise<void>;
   isTokenProcessed(tokenMint: string): Promise<boolean>;
   markTokenProcessed(tokenMint: string): Promise<void>;
+  getEntryCount(tokenMint: string): Promise<number>;
+  incrementEntryCount(tokenMint: string): Promise<number>;
   getPredictionRetryCount(tokenMint: string): Promise<number>;
   incrementPredictionRetryCount(tokenMint: string): Promise<number>;
   markPredictionFailed(tokenMint: string): Promise<void>;
+  acquirePendingTradeLock(tokenMint: string): Promise<boolean>;
+  releasePendingTradeLock(tokenMint: string): Promise<void>;
+  resetTradingState(): Promise<void>;
 }
 
 /**
@@ -32,10 +37,13 @@ export class RedisCacheService implements ICacheService {
   private client: RedisClientType;
   private readonly MINDMAP_PREFIX = 'bot:mindmap:';
   private readonly PROCESSED_TOKENS_KEY = 'bot:processed_tokens';
+  private readonly ENTRY_COUNT_PREFIX = 'bot:entry_count:';
   private readonly PREDICTION_RETRY_PREFIX = 'bot:prediction_retry:';
   private readonly PREDICTION_FAILED_KEY = 'bot:prediction_failed';
   private readonly DEFAULT_TTL = 1800; // 30 minutes in seconds
   private readonly RETRY_TTL = 3600; // 1 hour for retry tracking
+  private readonly LOCK_TTL = 60; // 60 seconds lock timeout
+  private readonly PENDING_TRADE_PREFIX = 'bot:pending_trade:';
   private isConnected = false;
   private reconnectAttempts = 0;
   private readonly MAX_RECONNECT_ATTEMPTS = 10;
@@ -295,6 +303,53 @@ export class RedisCacheService implements ICacheService {
   }
 
   /**
+   * Get the number of times we have entered a position for a token
+   */
+  async getEntryCount(tokenMint: string): Promise<number> {
+    try {
+      const key = `${this.ENTRY_COUNT_PREFIX}${tokenMint}`;
+      const count = await this.get(key);
+      return count ? parseInt(count, 10) : (await this.isTokenProcessed(tokenMint) ? 1 : 0);
+    } catch (error) {
+       ErrorHandler.handleCacheError(
+            error as Error,
+            `get entry count for ${tokenMint}`,
+            this.logger
+       );
+       return 0;
+    }
+  }
+
+  /**
+   * Increment the entry count for a token
+   */
+  async incrementEntryCount(tokenMint: string): Promise<number> {
+    try {
+        const key = `${this.ENTRY_COUNT_PREFIX}${tokenMint}`;
+        // If tracking legacy 'processed' status, ensure we respect it
+        if (await this.isTokenProcessed(tokenMint) && !(await this.exists(key))) {
+            await this.set(key, '1', this.DEFAULT_TTL);
+        }
+        
+        const count = await this.client.incr(key);
+        await this.client.expire(key, this.DEFAULT_TTL);
+        
+        // Ensure we also mark as processed for backward compatibility
+        await this.markTokenProcessed(tokenMint);
+        
+        this.logger?.debug('Incremented entry count', { tokenMint, count });
+        return count;
+    } catch (error) {
+        ErrorHandler.handleCacheError(
+            error as Error,
+            `increment entry count for ${tokenMint}`,
+            this.logger
+        );
+        throw error;
+    }
+  }
+
+  /**
    * Update cached mindmap data and refresh TTL
    */
   async updateMindmapData(tokenMint: string, data: MindmapData): Promise<void> {
@@ -411,4 +466,90 @@ export class RedisCacheService implements ICacheService {
       reconnectAttempts: this.reconnectAttempts
     };
   }
+  /**
+   * Acquire a distributed lock for pending trade execution
+   * Returns true if lock was acquired, false if already locked
+   */
+  async acquirePendingTradeLock(tokenMint: string): Promise<boolean> {
+    try {
+      const key = `${this.PENDING_TRADE_PREFIX}${tokenMint}`;
+      // SET key value NX EX ttl
+      // Returns 'OK' if set, null if not set (already exists)
+      const result = await this.client.set(key, '1', {
+        NX: true,
+        EX: this.LOCK_TTL
+      });
+      
+      const acquired = result === 'OK';
+      if (acquired) {
+        this.logger?.debug('Acquired pending trade lock', { tokenMint });
+      } else {
+        this.logger?.debug('Failed to acquire pending trade lock - already locked', { tokenMint });
+      }
+      
+      return acquired;
+    } catch (error) {
+      ErrorHandler.handleCacheError(
+        error as Error,
+        `acquire pending trade lock for ${tokenMint}`,
+        this.logger
+      );
+      // In case of Redis error, fail safe (don't trade) or fail open?
+      // Fail safe is better to avoid double buys
+      return false;
+    }
+  }
+
+  /**
+   * Release the pending trade lock
+   */
+  async releasePendingTradeLock(tokenMint: string): Promise<void> {
+    try {
+      const key = `${this.PENDING_TRADE_PREFIX}${tokenMint}`;
+      await this.delete(key);
+      this.logger?.debug('Released pending trade lock', { tokenMint });
+    } catch (error) {
+      // Just log error, lock will auto-expire
+      ErrorHandler.handleCacheError(
+        error as Error,
+        `release pending trade lock for ${tokenMint}`,
+        this.logger
+      );
+    }
+  }
+
+  /**
+   * Reset all trading state (processed tokens, entry counts, retries, failures)
+   * Useful for resetting paper trading environment
+   */
+  async resetTradingState(): Promise<void> {
+    try {
+      this.logger?.warn('🔄 Resetting all trading state in cache...');
+      
+      // Delete sets
+      await this.delete(this.PROCESSED_TOKENS_KEY);
+      await this.delete(this.PREDICTION_FAILED_KEY);
+      
+      // Delete patterns
+      // Note: keys() is blocking and dangerous in prod, but fine for a reset script/dev
+      const entryKeys = await this.client.keys(`${this.ENTRY_COUNT_PREFIX}*`);
+      if (entryKeys.length > 0) await this.client.del(entryKeys);
+      
+      const retryKeys = await this.client.keys(`${this.PREDICTION_RETRY_PREFIX}*`);
+      if (retryKeys.length > 0) await this.client.del(retryKeys);
+
+      const lockKeys = await this.client.keys(`${this.PENDING_TRADE_PREFIX}*`);
+      if (lockKeys.length > 0) await this.client.del(lockKeys);
+      
+      this.logger?.info('✅ Trading state reset complete');
+    } catch (error) {
+       ErrorHandler.handleCacheError(
+        error as Error,
+        'reset trading state',
+        this.logger
+       );
+       throw error;
+    }
+  }
 }
+
